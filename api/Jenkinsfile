@@ -1,0 +1,248 @@
+pipeline {
+
+    agent {
+        label {
+                label "jenkins-slave"
+        }
+    }
+
+    triggers {
+    pollSCM('H/2 * * * *')
+    }
+
+    options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    durabilityHint('PERFORMANCE_OPTIMIZED')
+    disableConcurrentBuilds()
+    }
+
+    environment {
+        SONARQUBE_SERVER = 'sonar-server' 
+        COMMIT_ID = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+        ECR_URI = '851725326403.dkr.ecr.us-east-1.amazonaws.com'
+        AWS_REGION = 'us-east-1'
+        EMAIL_RECIPIENTS = 'thanatisravankumar2003@gmail.com'
+        AWS_ACCOUNT_ID = '851725326403'
+    }
+
+    parameters {
+        choice(name: 'QUALITY_GATE', choices: ['Pass', 'Fail'], description: 'Fail pipeline based on SonarQube QualityGate')
+    }
+
+    // parameters {
+    //     choice(name: 'ZAP_SCAN_TYPE', choices: ['Baseline', 'API', 'FULL'], description: 'Choose the type of OWASP ZAP scan to run')
+    // }
+
+    stages {
+
+        stage('Clean Workspace') {
+            steps {
+            // Clean before build
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Static Code Analysis') {
+            parallel {
+                stage('OWASP Dependency Check') {
+                steps {
+                dir('api') {
+                    dependencyCheck additionalArguments: ''' 
+                                -o './'
+                                -s './'
+                                -f 'ALL' 
+                                --prettyPrint''', odcInstallation: 'owasp-check'
+                    
+                    dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+                }
+                }
+                }
+                stage('SonarQube Analysis') {
+                 environment {
+                        scannerHome = tool 'sonar-server'
+                    }                    
+                steps {
+                    withSonarQubeEnv('sonar-server') {
+                        sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectBaseDir=./api -Dsonar.projectKey=api-prod -Dsonar.projectName=api-prod -Dsonar.projectVersion=v${env.BUILD_NUMBER}"
+                    }
+                }
+                }
+            }   
+        }
+
+        stage('SonarQube Quality Gate') {
+            when {
+               expression { params.QUALITY_GATE in ['Pass', 'Fail']}
+            }
+            steps {
+                timeout(time: 3, unit: 'MINUTES') { // Wait for SonarQube to process the analysis
+                    script {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "Pipeline aborted due to SonarQube Quality Gate failure: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // stage('Install Dependencies') {
+        //     steps {
+        //         script {
+        //             echo "Install Dependencies"
+        //         }
+        //     }
+        // }
+
+        stage('Run Test') {
+            steps {
+                dir('api') {
+                sh 'ls -ltr'
+                // sh 'python3 test.py'
+                }
+            }
+        }
+
+        stage('Docker Image Build') {
+            steps {
+                dir('api') {
+                script {
+                docker.build('api-prod', '--network host --pull .')
+                }
+            }
+            }
+        }
+
+        stage('Anchore/Grype Vulnerability Scan') {
+            steps {
+                script {
+                    echo "Run Anchore Grype Vulnerability Scan"
+                    grypeScan scanDest: 'docker:api-prod:latest', repName: 'api-prod-scan-result.txt', autoInstall:true
+                }
+            }
+        }
+
+        stage('ECR Image Push') {
+            steps {
+                script {
+                    sh(script: "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}", returnStdout: true).trim()
+                    def imageTag = "${COMMIT_ID}-${env.BUILD_NUMBER}"
+                    docker.withRegistry('https://851725326403.dkr.ecr.us-east-1.amazonaws.com') {
+                    docker.image('api-prod').push(imageTag)
+                    }
+
+                }
+            }
+        }
+
+        stage("Checkout Helm Charts") {
+            steps {
+                checkout(changelog: false, poll: false, scm: [
+                    $class: 'GitSCM',
+                    branches: [
+                        [name: 'main'],
+                    ],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [
+                        [
+                            $class: 'RelativeTargetDirectory',
+                            relativeTargetDir: 'application-helm-charts',
+                        ],
+                    ],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [
+                        [
+                            url: 'git@gitlab.com:thanatisravankumar2003/application-helm-charts.git',
+                            credentialsId: 'gitlab-ssh'
+                        ],
+                    ],
+                ])
+            }
+
+        }
+
+        stage('KubeLinter On Helm Charts') {
+            steps {
+                dir('application-helm-charts') {
+                    script {
+                        try {
+                            // Run KubeLinter and save results to JSON
+                            sh "kube-linter lint ./api --format json > kubelinter-report.json"
+
+                            // Parse results and check for high-priority issues
+                            def kubelinterReport = readJSON file: 'kubelinter-report.json'
+                            def highIssues = kubelinterReport.reports.findAll { it.severity == 'high' }
+
+                            if (highIssues.size() > 0) {
+                                echo "KubeLinter detected ${highIssues.size()} high-priority issues."
+                            } else {
+                                echo "KubeLinter scan passed with no high-priority issues."
+                            }
+                        } catch (Exception e) {
+                            // Catch errors to prevent pipeline failure
+                            echo "KubeLinter encountered an error: ${e.message}"
+                        }
+                    }
+                }
+            }
+        }
+        stage('Sync ArgoCD API') {
+            steps {
+                dir('application-helm-charts') {
+                    sh 'aws eks update-kubeconfig --region us-east-1 --name DevSecOps-Cluster'
+                    // sh 'kubectl apply -f argocd/application-helm-charts/argocd/dev-applicationset.yaml'
+                    // sh 'sleep 10'
+                    sh 'argocd app sync api-dev'                    
+                    // sh '''
+                    //     helm upgrade --install api \
+                    //     --set image.tag=${COMMIT_ID}-${BUILD_NUMBER} \
+                    //     --namespace dev --create-namespace \
+                    //     --wait --timeout 300s \
+                    //     -f api/dev-values.yaml \
+                    //     api
+                    // '''
+                }
+             }
+         post {
+            always {
+                sh '''
+                    kubectl get pods -n prod
+                    POD_NAME=`kubectl get pods -n prod | grep api | awk {'print $1'}`
+                    echo "Running int test in $POD_NAME"
+                    #kubectl exec -ti $POD_NAME -n prod -- python3 test.py
+                '''
+            } 
+         }
+        }
+
+    }
+    post {
+        always {
+            
+                    emailext (
+                        subject: "Jenkins Build ${JOB_BASE_NAME} #${currentBuild.currentResult ?: 'SUCCESS'}",
+                            body: """
+                            
+                            Commit ID: ${COMMIT_ID}
+                            Build Link: ${env.BUILD_URL}
+                            Triggered By: ${env.BUILD_USER}
+
+                            Reports:
+                            - Grype JSON Report: ${env.WORKSPACE}/grype-report.json
+                            - Grype Scan Result: ${env.WORKSPACE}/api-prod-scan-result.txt
+                            - OWASP Dependency Report: ${env.WORKSPACE}/api/dependency-check-report.xml
+                        """,
+                        to: "${EMAIL_RECIPIENTS}",
+                        attachmentsPattern: "grype-report.json, api-prod-scan-result.txt, api/dependency-check-report.xml"  // Attach the reports
+                    )
+
+        }
+
+    }  
+}

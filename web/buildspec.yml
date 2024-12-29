@@ -1,0 +1,40 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+    commands:
+      - echo "Installing Trivy..."
+      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+      - echo "Installing Sonar Scanner..."
+      - wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610.zip
+      - unzip sonar-scanner-cli-6.2.1.4610.zip -d /opt/
+      - export PATH=/opt/sonar-scanner-6.2.1.4610/bin/:$PATH
+
+  pre_build:
+    commands:
+      - echo "Logging in to ECR..."
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin 851725326403.dkr.ecr.us-east-1.amazonaws.com
+      - echo "Setting environment variables for SonarQube, EKS, and ECR..."
+      - export SONAR_PROJECT_KEY="web-codebuild"
+      - export SONAR_HOST_URL="http://34.200.243.87:9000/"
+      - export SONAR_LOGIN="squ_e5e870acb60bd0b4d82594866bdb430fa0b9f8cd"
+      - export EKS_CLUSTER_NAME="DevSecOps-Cluster"
+      - export IMAGE_TAG=$CODEBUILD_BUILD_NUMBER
+      - echo $IMAGE_TAG
+
+  build:
+    commands:
+      - echo "Running SonarQube scan..."
+      - which sonar-scanner
+      - /opt/sonar-scanner-6.2.1.4610/bin/sonar-scanner -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_LOGIN
+      - echo "Building Docker image..."
+      - cd web && docker build -t 851725326403.dkr.ecr.us-east-1.amazonaws.com:$IMAGE_TAG . && cd ../
+      - echo "Running Trivy scan..."
+      - bin/trivy image --security-checks vuln --format json -o trivy-report.json 851725326403.dkr.ecr.us-east-1.amazonaws.com:$IMAGE_TAG
+
+artifacts:
+  files:
+    - trivy-report.json
+  discard-paths: yes
